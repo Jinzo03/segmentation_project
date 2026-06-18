@@ -10,30 +10,17 @@ from model import UNet
 from dataset import SegmentationDataset
 
 # Hyperparameters
-LEARNING_RATE = 1e-5
+LEARNING_RATE = 1e-4  # Adjusted slightly higher for multiclass convergence
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 16
 NUM_EPOCHS = 20
 IMAGE_HEIGHT = 256
 IMAGE_WIDTH = 256
-TRAIN_IMG_DIR = "data/train_images/"
-TRAIN_MASK_DIR = "data/train_masks/"
+NUM_CLASSES = 3  # 0: Background, 1: Circle, 2: Square
+TRAIN_IMG_DIR = "data/images/"  # Update path if using standard data split directories
+TRAIN_MASK_DIR = "data/masks/"
 VAL_IMG_DIR = "data/val_images/"
 VAL_MASK_DIR = "data/val_masks/"
-
-class DiceBCELoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
-
-    def forward(self, pred, target):
-        bce_loss = self.bce(pred, target)
-        pred = torch.sigmoid(pred)
-        pred = pred.view(-1)
-        target = target.view(-1)
-        intersection = (pred * target).sum()
-        dice_loss = 1 - ((2.0 * intersection + 1e-8) / (pred.sum() + target.sum() + 1e-8))
-        return bce_loss + dice_loss
 
 def train_fn(loader, model, optimizer, loss_fn, scaler):
     model.train()
@@ -42,12 +29,15 @@ def train_fn(loader, model, optimizer, loss_fn, scaler):
 
     for data, targets in loop:
         data = data.to(DEVICE)
-        targets = targets.float().unsqueeze(1).to(DEVICE)
+        
+        # FIX 1: CrossEntropyLoss requires target to be LongTensor and shaped (N, H, W)
+        # Removed .unsqueeze(1) and changed .float() to .long()
+        targets = targets.long().to(DEVICE)
 
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast(device_type=DEVICE, enabled=(DEVICE == "cuda")):
-            predictions = model(data)
+            predictions = model(data)  # Output shape: (N, NUM_CLASSES, H, W)
             loss = loss_fn(predictions, targets)
 
         scaler.scale(loss).backward()
@@ -59,18 +49,42 @@ def train_fn(loader, model, optimizer, loss_fn, scaler):
 
     return epoch_loss / len(loader)
 
-def check_accuracy(loader, model):
+def check_mIoU(loader, model, num_classes=3):
+    """
+    Calculates Mean Intersection over Union (mIoU) across all classes.
+    Replaces binary Dice score calculation for multi-class tasks.
+    """
     model.eval()
-    dice_score = 0
+    total_iou = 0.0
+    total_batches = 0
+    
     with torch.no_grad():
         for x, y in loader:
-            x, y = x.to(DEVICE), y.float().unsqueeze(1).to(DEVICE)
-            preds = torch.sigmoid(model(x))
-            preds = (preds > 0.5).float()
-            dice_score += (2 * (preds * y).sum()) / ((preds + y).sum() + 1e-8)
+            x = x.to(DEVICE)
+            y = y.long().to(DEVICE)  # Shape: (N, H, W)
+            
+            # FIX 2: Multiclass evaluation uses argmax over the channel dim (dim=1)
+            logits = model(x)
+            preds = torch.argmax(logits, dim=1)  # Shape: (N, H, W)
+            
+            batch_iou = 0.0
+            for cls in range(num_classes):
+                pred_cls = (preds == cls)
+                true_cls = (y == cls)
+                
+                intersection = (pred_cls & true_cls).sum().item()
+                union = (pred_cls | true_cls).sum().item()
+                
+                if union == 0:
+                    batch_iou += 1.0  # Avoid zero division if class isn't present in ground truth or pred
+                else:
+                    batch_iou += intersection / union
+                    
+            total_iou += (batch_iou / num_classes)
+            total_batches += 1
 
     model.train()
-    return dice_score / len(loader)
+    return total_iou / total_batches if total_batches > 0 else 0.0
 
 def main():
     train_transform = A.Compose([
@@ -79,36 +93,39 @@ def main():
         ToTensorV2(),
     ])
 
-    # FIX 1: defined val_transform (was undefined "val_transforms")
     val_transform = A.Compose([
         A.Resize(height=IMAGE_HEIGHT, width=IMAGE_WIDTH),
         A.Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0], max_pixel_value=255.0),
         ToTensorV2(),
     ])
 
-    model = UNet(in_channels=3, out_channels=1).to(DEVICE)
-    loss_fn = DiceBCELoss()
+    # FIX 3: Configured U-Net model output channels to handle 3 unique prediction classes
+    model = UNet(in_channels=3, out_channels=NUM_CLASSES).to(DEVICE)
+    
+    # Modern Optimization: Compile the network graph if using compatible system engines
+    if hasattr(torch, 'compile') and DEVICE == 'cuda':
+        model = torch.compile(model)
+        
+    loss_fn = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE == "cuda"))
 
     train_ds = SegmentationDataset(image_dir=TRAIN_IMG_DIR, mask_dir=TRAIN_MASK_DIR, transform=train_transform)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, num_workers=2, pin_memory=(DEVICE=="cuda"), shuffle=True)
 
-    # FIX 2: use val_transform instead of val_transforms
     val_ds = SegmentationDataset(image_dir=VAL_IMG_DIR, mask_dir=VAL_MASK_DIR, transform=val_transform)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, num_workers=2, pin_memory=(DEVICE=="cuda"))
 
-    # FIX 3: removed misplaced validation check block; training loop runs unconditionally
     for epoch in range(NUM_EPOCHS):
         print(f"--- Epoch {epoch+1}/{NUM_EPOCHS} ---")
 
-        # FIX 4: capture train loss and print it
         train_loss = train_fn(train_loader, model, optimizer, loss_fn, scaler)
         print(f"Train Loss: {train_loss:.4f}")
 
         if len(val_loader) > 0:
-            val_dice = check_accuracy(val_loader, model)
-            print(f"Validation Dice score: {val_dice:.4f}")
+            # FIX 4: Hooked up the new multi-class metric
+            val_miou = check_mIoU(val_loader, model, num_classes=NUM_CLASSES)
+            print(f"Validation mIoU: {val_miou:.4f}")
         else:
             print("WARNING: Validation loader is empty! Skipping validation.")
 
