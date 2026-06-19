@@ -6,7 +6,8 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
 
-from model import UNet
+# FIX 1: Imported the new AttentionUNet class instead of the standard UNet
+from model import AttentionUNet
 from dataset import SegmentationDataset
 
 # Hyperparameters
@@ -30,8 +31,7 @@ def train_fn(loader, model, optimizer, loss_fn, scaler):
     for data, targets in loop:
         data = data.to(DEVICE)
         
-        # FIX 1: CrossEntropyLoss requires target to be LongTensor and shaped (N, H, W)
-        # Removed .unsqueeze(1) and changed .float() to .long()
+        # CrossEntropyLoss requires target to be LongTensor and shaped (N, H, W)
         targets = targets.long().to(DEVICE)
 
         optimizer.zero_grad(set_to_none=True)
@@ -63,7 +63,7 @@ def check_mIoU(loader, model, num_classes=3):
             x = x.to(DEVICE)
             y = y.long().to(DEVICE)  # Shape: (N, H, W)
             
-            # FIX 2: Multiclass evaluation uses argmax over the channel dim (dim=1)
+            # Multiclass evaluation uses argmax over the channel dim (dim=1)
             logits = model(x)
             preds = torch.argmax(logits, dim=1)  # Shape: (N, H, W)
             
@@ -99,8 +99,8 @@ def main():
         ToTensorV2(),
     ])
 
-    # FIX 3: Configured U-Net model output channels to handle 3 unique prediction classes
-    model = UNet(in_channels=3, out_channels=NUM_CLASSES).to(DEVICE)
+    # Configured U-Net model output channels to handle 3 unique prediction classes
+    model = AttentionUNet(in_channels=3, out_channels=NUM_CLASSES).to(DEVICE)
     
     # Modern Optimization: Compile the network graph if using compatible system engines
     if hasattr(torch, 'compile') and DEVICE == 'cuda':
@@ -123,13 +123,14 @@ def main():
         print(f"Train Loss: {train_loss:.4f}")
 
         if len(val_loader) > 0:
-            # FIX 4: Hooked up the new multi-class metric
             val_miou = check_mIoU(val_loader, model, num_classes=NUM_CLASSES)
             print(f"Validation mIoU: {val_miou:.4f}")
         else:
             print("WARNING: Validation loader is empty! Skipping validation.")
 
-        torch.save({"state_dict": model.state_dict()}, f"checkpoint_{epoch+1}.pth.tar")
+        # FIX 2: Bypasses the torch.compile wrapper so the saved dictionary keys match the raw model exactly
+        raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+        torch.save({"state_dict": raw_model.state_dict()}, f"checkpoint_{epoch+1}.pth.tar")
 
 if __name__ == "__main__":
     main()

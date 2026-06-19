@@ -6,7 +6,7 @@ from PIL import Image
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-from model import UNet
+from model import AttentionUNet
 
 # Parameters (Must match train.py exactly)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -29,8 +29,7 @@ def color_code_mask(mask_2d):
 
 def visual_inference_multiclass():
     # 1. Initialize model
-    model = UNet(in_channels=3, out_channels=NUM_CLASSES).to(DEVICE)
-    
+    model = AttentionUNet(in_channels=3, out_channels=NUM_CLASSES).to(DEVICE)    
     # Load raw checkpoint dictionary
     checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
     state_dict = checkpoint["state_dict"]

@@ -5,4 +5,5 @@ rand1.py
 rand2.py
 team_a_logo.png
 team_b_logo.png
-data/
+/data
+/data_instance
