@@ -16,8 +16,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 4       # Detection models are memory-heavy; keep batch size modest
 NUM_EPOCHS = 10      # Fast run to see it converge
 LEARNING_RATE = 0.005
-NUM_CLASSES = 3      # 0: Background, 1: Circle, 2: Square (Strictly defined this way)
-DATA_DIR = "data_instance"
+NUM_CLASSES = 2      # 0: Background, 1: Circle, 2: Square (Strictly defined this way)
+DATA_DIR = "data_cells"
 
 def get_instance_model(num_classes):
     """

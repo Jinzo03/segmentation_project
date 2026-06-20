@@ -11,8 +11,8 @@ from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 # Configuration
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHECKPOINT_PATH = "instance_checkpoint_10.pth.tar"
-NUM_CLASSES = 3  # 0: Background, 1: Circle, 2: Square
-TEST_IMG_DIR = "data_instance/images/"
+NUM_CLASSES = 2  # 0: Background, 1: Circle, 2: Square
+TEST_IMG_DIR = "data_cells/images/"
 CONFIDENCE_THRESHOLD = 0.70  # Only display objects the model is more than 70% sure about
 
 def get_instance_model(num_classes):
@@ -79,7 +79,7 @@ def visual_inference_instance():
     axes[1].axis("off")
 
     # Define strings mapping class labels
-    class_map = {1: "Circle", 2: "Square"}
+    class_map = {1: "Cell Nucleus"}
     
     # Generate a set of unique colors to differentiate instances
     cmap = plt.get_cmap("tab10")
