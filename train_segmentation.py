@@ -18,54 +18,56 @@ EMBED_DIM = 128
 IMAGE_SIZE = 64
 
 # --- 1. Dataset with Pixel-Perfect Masks ---
+# --- Upgraded Dataset with On-The-Fly Domain Randomization ---
 class SegmentationDataset(Dataset):
-    def __init__(self, data_dir, image_size=64):
-        self.data_dir = data_dir
-        self.image_size = image_size
-        self.image_paths = sorted([
-            os.path.join(data_dir, f)
-            for f in os.listdir(data_dir)
-            if f.endswith(".png")
-        ])
-
-        if len(self.image_paths) == 0:
-            raise ValueError(f"No .png images found in: {data_dir}")
-
-        rng = np.random.default_rng(42)
-        self.labels = rng.integers(0, 2, size=len(self.image_paths))
-        self.anomaly_coords = [
-            (int(rng.integers(20, 44)), int(rng.integers(20, 44)))
-            for _ in range(len(self.image_paths))
-        ]
-
+    def __init__(self, data_dir, hardened=False):
+        self.image_paths = sorted([os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".png")])
+        self.hardened = hardened
+        
+        # Deterministic labels/coords so train/val splits remain constant
+        np.random.seed(42)
+        self.labels = np.random.choice([0, 1], size=len(self.image_paths))
+        self.anomaly_coords = [(np.random.randint(20, 44), np.random.randint(20, 44)) for _ in range(len(self.image_paths))]
+        
     def __len__(self):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
         img = cv2.imread(self.image_paths[idx], cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise ValueError(f"Failed to read image: {self.image_paths[idx]}")
-
-        if img.shape[:2] != (self.image_size, self.image_size):
-            img = cv2.resize(img, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
-
-        label = int(self.labels[idx])
-        mask = np.zeros_like(img, dtype=np.uint8)
-
+        label = self.labels[idx]
+        mask = np.zeros_like(img)
+        
+        # 1. Procedurally generate the infection anomalies
         if label == 1:
             ix, iy = self.anomaly_coords[idx]
-
-            # Draw on the image
             cv2.circle(img, (ix, iy), 6, 255, -1)
-            cv2.circle(img, (ix + 5, iy - 4), 3, 200, -1)
-
-            # Draw the exact same shapes on the mask
+            cv2.circle(img, (ix+5, iy-4), 3, 200, -1)
             cv2.circle(mask, (ix, iy), 6, 255, -1)
-            cv2.circle(mask, (ix + 5, iy - 4), 3, 255, -1)
+            cv2.circle(mask, (ix+5, iy-4), 3, 255, -1)
+            
+        # 2. THE HARDENING CORE: Inject Domain Randomization if this is the training split
+        if self.hardened:
+            # Augmentation A: Random Background Shift (0 to 50 gray baseline)
+            bg_shift = np.random.randint(0, 51)
+            img = np.where(img == 0, bg_shift, img)
+            
+            # Augmentation B: Illumination & Contrast Fluctuations
+            contrast_factor = np.random.uniform(0.7, 1.3)
+            img = np.clip(img * contrast_factor, 0, 255).astype(np.uint8)
+            
+            # Augmentation C: Defocus Lens Blur (30% chance of being out of focus)
+            if np.random.rand() < 0.3:
+                img = cv2.GaussianBlur(img, (3, 3), 0)
+                
+            # Augmentation D: High-Frequency Sensor Noise
+            noise_sigma = np.random.uniform(10, 35) # Dynamic noise intensity
+            noise = np.random.normal(0, noise_sigma, img.shape).astype(np.int16)
+            img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
+        # Convert to production tensors
         img_tensor = torch.tensor(img, dtype=torch.float32).unsqueeze(0) / 255.0
         mask_tensor = torch.tensor(mask, dtype=torch.float32).unsqueeze(0) / 255.0
-
+        
         return img_tensor, mask_tensor
 
 # --- 2. The TransUNet Architecture ---
@@ -198,18 +200,26 @@ def stress_test_model(model):
 def train_segmenter():
     print(f"Booting up Segmentation Engine on {DEVICE}...")
 
-    dataset = SegmentationDataset(DATA_DIR, image_size=IMAGE_SIZE)
-
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    if train_size == 0 or val_size == 0:
-        raise ValueError("Dataset is too small to split into train/val sets.")
-
-    generator = torch.Generator().manual_seed(42)
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=generator)
-
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    # --- Replace the original dataset/dataloader split with this ---
+    # Create two separate instances of the dataset so 'hardened' applies correctly
+    train_dataset = SegmentationDataset(DATA_DIR, hardened=True)
+    val_dataset = SegmentationDataset(DATA_DIR, hardened=False)
+    
+    # Generate indices for a deterministic split
+    dataset_size = len(train_dataset)
+    indices = list(range(dataset_size))
+    split = 400
+    
+    np.random.seed(42)
+    np.random.shuffle(indices)
+    train_indices, val_indices = indices[:split], indices[split:]
+    
+    # Wrap with Subsets
+    train_subset = torch.utils.data.Subset(train_dataset, train_indices)
+    val_subset = torch.utils.data.Subset(val_dataset, val_indices)
+    
+    train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_subset, batch_size=BATCH_SIZE, shuffle=False)
 
     model = SimpleTransUNet(patch_size=PATCH_SIZE, embed_dim=EMBED_DIM).to(DEVICE)
 
