@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 import matplotlib.pyplot as plt
 
 # --- Configuration ---
@@ -15,39 +15,57 @@ LR = 3e-4
 DATA_DIR = "synthetic_dataset/images"
 PATCH_SIZE = 8
 EMBED_DIM = 128
+IMAGE_SIZE = 64
 
 # --- 1. Dataset with Pixel-Perfect Masks ---
 class SegmentationDataset(Dataset):
-    def __init__(self, data_dir):
-        self.image_paths = sorted([os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".png")])
-        np.random.seed(42)
-        # 50% chance of anomaly
-        self.labels = np.random.choice([0, 1], size=len(self.image_paths))
-        self.anomaly_coords = [(np.random.randint(20, 44), np.random.randint(20, 44)) for _ in range(len(self.image_paths))]
-        
+    def __init__(self, data_dir, image_size=64):
+        self.data_dir = data_dir
+        self.image_size = image_size
+        self.image_paths = sorted([
+            os.path.join(data_dir, f)
+            for f in os.listdir(data_dir)
+            if f.endswith(".png")
+        ])
+
+        if len(self.image_paths) == 0:
+            raise ValueError(f"No .png images found in: {data_dir}")
+
+        rng = np.random.default_rng(42)
+        self.labels = rng.integers(0, 2, size=len(self.image_paths))
+        self.anomaly_coords = [
+            (int(rng.integers(20, 44)), int(rng.integers(20, 44)))
+            for _ in range(len(self.image_paths))
+        ]
+
     def __len__(self):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
         img = cv2.imread(self.image_paths[idx], cv2.IMREAD_GRAYSCALE)
-        label = self.labels[idx]
-        
-        # Create a blank black mask
-        mask = np.zeros_like(img)
-        
+        if img is None:
+            raise ValueError(f"Failed to read image: {self.image_paths[idx]}")
+
+        if img.shape[:2] != (self.image_size, self.image_size):
+            img = cv2.resize(img, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
+
+        label = int(self.labels[idx])
+        mask = np.zeros_like(img, dtype=np.uint8)
+
         if label == 1:
             ix, iy = self.anomaly_coords[idx]
-            # Draw on the Image
+
+            # Draw on the image
             cv2.circle(img, (ix, iy), 6, 255, -1)
-            cv2.circle(img, (ix+5, iy-4), 3, 200, -1)
-            # Draw the EXACT same shapes on the Mask
+            cv2.circle(img, (ix + 5, iy - 4), 3, 200, -1)
+
+            # Draw the exact same shapes on the mask
             cv2.circle(mask, (ix, iy), 6, 255, -1)
-            cv2.circle(mask, (ix+5, iy-4), 3, 255, -1)
-            
+            cv2.circle(mask, (ix + 5, iy - 4), 3, 255, -1)
+
         img_tensor = torch.tensor(img, dtype=torch.float32).unsqueeze(0) / 255.0
-        # Masks are binary: 0.0 for background, 1.0 for anomaly
         mask_tensor = torch.tensor(mask, dtype=torch.float32).unsqueeze(0) / 255.0
-        
+
         return img_tensor, mask_tensor
 
 # --- 2. The TransUNet Architecture ---
@@ -76,178 +94,228 @@ class SimpleTransUNet(nn.Module):
         self.patch_size = patch_size
         self.grid_size = image_size // patch_size
         self.num_patches = self.grid_size ** 2
-        
-        # --- THE SKIP CONNECTION (High-Res Memory) ---
-        # We extract crisp 64x64 pixel features before the Transformer ruins the resolution
+
+        # High-res skip branch
         self.skip_extractor = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU()
         )
-        
-        # --- ENCODER (The Big Picture) ---
+
+        # Patch embedding + transformer
         self.patch_embed = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.pos_embedding = nn.Parameter(torch.randn(1, self.num_patches, embed_dim) * 0.02)
         self.blocks = nn.Sequential(*[TransformerBlock(embed_dim, num_heads=4) for _ in range(3)])
         self.norm = nn.LayerNorm(embed_dim)
-        
-        # --- DECODER (Upscaling) ---
+
+        # Decoder
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(embed_dim, 64, kernel_size=2, stride=2), # 8x8 -> 16x16
+            nn.ConvTranspose2d(embed_dim, 64, kernel_size=2, stride=2),
             nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),        # 16x16 -> 32x32
+            nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
             nn.ReLU(),
-            nn.ConvTranspose2d(32, 32, kernel_size=2, stride=2)         # 32x32 -> 64x64 (Matches skip!)
+            nn.ConvTranspose2d(32, 32, kernel_size=2, stride=2)
         )
-        
-        # --- FUSION LAYER ---
-        # We concatenate the 32 channels from the decoder and 32 channels from the skip connection
+
+        # Final fusion
         self.final_fusion = nn.Sequential(
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(32, 1, kernel_size=1) # Squash to 1 channel mask prediction
+            nn.Conv2d(32, 1, kernel_size=1)
         )
 
     def forward(self, x):
         B = x.shape[0]
-        
-        # 1. Save the high-res details
-        skip_features = self.skip_extractor(x) # Shape: [B, 32, 64, 64]
-        
-        # 2. Process the low-res global context
-        vit_x = self.patch_embed(x).flatten(2).transpose(1, 2)
+
+        skip_features = self.skip_extractor(x)  # [B, 32, 64, 64]
+
+        vit_x = self.patch_embed(x).flatten(2).transpose(1, 2)  # [B, N, C]
         vit_x = vit_x + self.pos_embedding
         vit_x = self.blocks(vit_x)
         vit_x = self.norm(vit_x)
-        
-        # 3. Upscale the ViT features back to 64x64
+
         vit_x = vit_x.transpose(1, 2).reshape(B, -1, self.grid_size, self.grid_size)
-        decoded_x = self.decoder(vit_x) # Shape: [B, 32, 64, 64]
-        
-        # 4. THE MAGIC: Concatenate the big picture with the fine details along the channel dimension
-        fused_x = torch.cat([decoded_x, skip_features], dim=1) # Shape: [B, 64, 64, 64]
-        
-        # 5. Final pass to predict exactly where the pixels are
+        decoded_x = self.decoder(vit_x)  # [B, 32, 64, 64]
+
+        fused_x = torch.cat([decoded_x, skip_features], dim=1)  # [B, 64, 64, 64]
         return self.final_fusion(fused_x)
 
-# --- 3. Training Engine ---
-def train_segmenter():
-    print(f"Booting up Segmentation Engine on {DEVICE}...")
-    
-    dataset = SegmentationDataset(DATA_DIR)
-    train_size = 400
-    val_size = len(dataset) - train_size
-    
-    torch.manual_seed(42)
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-    
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    
-    model = SimpleTransUNet(patch_size=PATCH_SIZE, embed_dim=EMBED_DIM).to(DEVICE)
-    
-    # Loss function for predicting binary (0 or 1) pixels
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-    
-    history_loss = []
-    
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        total_loss = 0
-        for imgs, masks in train_loader:
-            imgs, masks = imgs.to(DEVICE), masks.to(DEVICE)
-            
-            optimizer.zero_grad()
-            preds = model(imgs) # Model outputs [B, 1, 64, 64] prediction
-            loss = criterion(preds, masks)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            
-        avg_loss = total_loss / len(train_loader)
-        history_loss.append(avg_loss)
-        print(f"Epoch [{epoch}/{EPOCHS}] | Train Loss: {avg_loss:.4f}")
+# --- 3. Metrics ---
+def calculate_segmentation_metrics(pred_masks, true_masks, threshold=0.5):
+    pred_binary = (pred_masks > threshold).float()
+    true_binary = true_masks.float()
 
-    # --- Plot the Loss and Visualize a Prediction ---
-    model.eval()
-    with torch.no_grad():
-        # Grab one batch from validation
-        val_imgs, val_masks = next(iter(val_loader))
-        val_imgs, val_masks = val_imgs.to(DEVICE), val_masks.to(DEVICE)
-        
-        # Get raw predictions and apply sigmoid to squash to 0.0 - 1.0 probability
-        raw_preds = model(val_imgs)
-        pred_masks = torch.sigmoid(raw_preds)
+    pred_flat = pred_binary.reshape(-1)
+    true_flat = true_binary.reshape(-1)
 
-    # Let's visualize the first image in the validation batch
-    img_viz = val_imgs[0].cpu().squeeze().numpy()
-    true_mask_viz = val_masks[0].cpu().squeeze().numpy()
-    pred_mask_viz = pred_masks[0].cpu().squeeze().numpy()
+    intersection = (pred_flat * true_flat).sum()
+    total_pixels_combined = pred_flat.sum() + true_flat.sum()
+    union = total_pixels_combined - intersection
 
-    plt.figure(figsize=(15, 4))
-    
-    plt.subplot(1, 4, 1)
-    plt.plot(history_loss, color='red', label="BCE Loss")
-    plt.title("Segmentation Loss Curve")
-    plt.xlabel("Epochs")
-    
-    plt.subplot(1, 4, 2)
-    plt.imshow(img_viz, cmap="gray")
-    plt.title("Input Cell")
-    plt.axis("off")
-    
-    plt.subplot(1, 4, 3)
-    plt.imshow(true_mask_viz, cmap="gray")
-    plt.title("Ground Truth Mask")
-    plt.axis("off")
-    
-    plt.subplot(1, 4, 4)
-    plt.imshow(pred_mask_viz, cmap="magma") # Heatmap style prediction
-    plt.title("AI Predicted Mask")
-    plt.axis("off")
-    
-    plt.tight_layout()
-    plt.savefig("segmentation_results.png")
-    print("\nTraining complete! Look at 'segmentation_results.png' to see the AI's pixel mapping.")
-    stress_test_model(model)
-# --- 4. The Sim-to-Real Stress Test ---
+    smooth = 1e-6
+    iou = (intersection + smooth) / (union + smooth)
+    dice = (2.0 * intersection + smooth) / (total_pixels_combined + smooth)
+
+    return iou.item(), dice.item()
+
+# --- 4. Sim-to-Real Stress Test ---
 def stress_test_model(model):
     print("\nInitiating Out-of-Distribution Stress Test...")
-    
-    # 1. Create a "real" messy cell: gray background, irregular ellipse shape
+
     img = np.ones((64, 64), dtype=np.uint8) * 60
-    cv2.ellipse(img, (32, 32), (24, 16), 45, 0, 360, 180, -1) 
-    
-    # 2. Add heavy real-world microscope noise
+    cv2.ellipse(img, (32, 32), (24, 16), 45, 0, 360, 180, -1)
+
     noise = np.random.normal(0, 40, (64, 64)).astype(np.int16)
     img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-    
-    # 3. Add the infection anomaly in a totally random spot
+
     cv2.circle(img, (22, 42), 6, 250, -1)
-    
-    # 4. Run Inference
+
     img_tensor = torch.tensor(img, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(DEVICE) / 255.0
-    
+
     model.eval()
     with torch.no_grad():
         pred = torch.sigmoid(model(img_tensor))
         pred_mask = pred[0].cpu().squeeze().numpy()
-        
-    # 5. Visualize
+
     plt.figure(figsize=(10, 5))
+
     plt.subplot(1, 2, 1)
     plt.imshow(img, cmap="gray")
     plt.title("Messy 'Real-World' Cell")
     plt.axis("off")
-    
+
     plt.subplot(1, 2, 2)
     plt.imshow(pred_mask, cmap="magma")
     plt.title("AI Prediction")
     plt.axis("off")
-    
+
     plt.tight_layout()
     plt.savefig("stress_test_result.png")
+    plt.close()
     print("Stress test complete. Check 'stress_test_result.png'.")
+
+# --- 5. Training Engine ---
+def train_segmenter():
+    print(f"Booting up Segmentation Engine on {DEVICE}...")
+
+    dataset = SegmentationDataset(DATA_DIR, image_size=IMAGE_SIZE)
+
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    if train_size == 0 or val_size == 0:
+        raise ValueError("Dataset is too small to split into train/val sets.")
+
+    generator = torch.Generator().manual_seed(42)
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=generator)
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    model = SimpleTransUNet(patch_size=PATCH_SIZE, embed_dim=EMBED_DIM).to(DEVICE)
+
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+
+    history_loss = []
+    history_val_loss = []
+    history_iou = []
+    history_dice = []
+
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        total_loss = 0.0
+
+        for imgs, masks in train_loader:
+            imgs, masks = imgs.to(DEVICE), masks.to(DEVICE)
+
+            optimizer.zero_grad()
+            preds = model(imgs)
+            loss = criterion(preds, masks)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(train_loader)
+        history_loss.append(avg_loss)
+
+        model.eval()
+        val_loss = 0.0
+        total_iou = 0.0
+        total_dice = 0.0
+
+        sample_imgs = None
+        sample_masks = None
+        sample_preds = None
+
+        with torch.no_grad():
+            for imgs, masks in val_loader:
+                imgs, masks = imgs.to(DEVICE), masks.to(DEVICE)
+                raw_preds = model(imgs)
+                loss = criterion(raw_preds, masks)
+                val_loss += loss.item()
+
+                prob_preds = torch.sigmoid(raw_preds)
+                batch_iou, batch_dice = calculate_segmentation_metrics(prob_preds, masks)
+                total_iou += batch_iou
+                total_dice += batch_dice
+
+                if sample_imgs is None:
+                    sample_imgs = imgs.detach().cpu()
+                    sample_masks = masks.detach().cpu()
+                    sample_preds = prob_preds.detach().cpu()
+
+        avg_val_loss = val_loss / len(val_loader)
+        avg_iou = total_iou / len(val_loader)
+        avg_dice = total_dice / len(val_loader)
+
+        history_val_loss.append(avg_val_loss)
+        history_iou.append(avg_iou)
+        history_dice.append(avg_dice)
+
+        print(
+            f"Epoch [{epoch}/{EPOCHS}] | "
+            f"Train Loss: {avg_loss:.4f} | "
+            f"Val Loss: {avg_val_loss:.4f} | "
+            f"IoU: {avg_iou:.4f} | "
+            f"Dice: {avg_dice:.4f}"
+        )
+
+    # Visualize the first validation sample
+    img_viz = sample_imgs[0].squeeze().numpy()
+    true_mask_viz = sample_masks[0].squeeze().numpy()
+    pred_mask_viz = sample_preds[0].squeeze().numpy()
+
+    plt.figure(figsize=(15, 4))
+
+    plt.subplot(1, 4, 1)
+    plt.plot(history_loss, label="Train Loss")
+    plt.plot(history_val_loss, label="Val Loss")
+    plt.title("Loss Curve")
+    plt.xlabel("Epochs")
+    plt.legend()
+
+    plt.subplot(1, 4, 2)
+    plt.imshow(img_viz, cmap="gray")
+    plt.title("Input Image")
+    plt.axis("off")
+
+    plt.subplot(1, 4, 3)
+    plt.imshow(true_mask_viz, cmap="gray")
+    plt.title("Ground Truth Mask")
+    plt.axis("off")
+
+    plt.subplot(1, 4, 4)
+    plt.imshow(pred_mask_viz, cmap="magma")
+    plt.title("Predicted Mask")
+    plt.axis("off")
+
+    plt.tight_layout()
+    plt.savefig("segmentation_results.png")
+    plt.close()
+
+    print("\nTraining complete! Look at 'segmentation_results.png' to see the pixel mapping.")
+    stress_test_model(model)
+
 if __name__ == "__main__":
     train_segmenter()
